@@ -5298,10 +5298,21 @@ imageblock_load(void *translator, LLVMValueRef slice, nir_def *member, nir_def *
    }
    nir_builder *b = &t->b;
    struct value address = *base;
-   member = member ? nir_u2u64(b, member) : nir_umod_imm(b, base->def, t->imageblock_element);
-   address.def = nir_iadd(b, member, nir_u2u64(b, nir_imul_imm(b, pixel, t->imageblock_element)));
+   unsigned bytes = components * (bits / 8);
+   unsigned alignment = bits / 8;
+   bool zero_member = imageblock_data_call(slice);
+   if (util_is_power_of_two_nonzero(bytes) && t->imageblock_element % bytes == 0 &&
+       (zero_member || (base->offset_known && ((base->offset % t->imageblock_element) % bytes == 0))))
+      alignment = MIN2(bytes, 16u);
+   nir_def *pixel_offset = nir_u2u64(b, nir_imul_imm(b, pixel, t->imageblock_element));
+   if (zero_member) {
+      address.def = pixel_offset;
+   } else {
+      member = member ? nir_u2u64(b, member) : nir_umod_imm(b, base->def, t->imageblock_element);
+      address.def = nir_iadd(b, member, pixel_offset);
+   }
    address.offset_known = false;
-   return memory_access(t, &address, NULL, NULL, 0, components, bits, bits / 8);
+   return memory_access(t, &address, NULL, NULL, 0, components, bits, alignment);
 }
 
 /* The 32-bit offset in its element of the kernel imageblock's member a
@@ -5315,6 +5326,8 @@ imageblock_member(void *translator, LLVMValueRef slice)
       fail(t, STELA_AIR_MEMORY, "an imageblock slice that names no member of the imageblock");
       return NULL;
    }
+   if (imageblock_data_call(slice))
+      return nir_imm_int(&t->b, 0);
    return nir_u2u32(&t->b, nir_umod_imm(&t->b, base->def, t->imageblock_element));
 }
 
@@ -5368,7 +5381,8 @@ find_deferred_slices(struct translator *t)
          if (!calls(inst, "air.write_imageblock_slice_to_texture_2d", true))
             continue;
          LLVMValueRef next = LLVMGetNextInstruction(inst);
-         if (next && LLVMGetInstructionOpcode(next) == LLVMUncondBr) {
+         for (unsigned hops = 0;
+              hops < 16 && next && LLVMGetInstructionOpcode(next) == LLVMUncondBr; hops++) {
             next = LLVMGetFirstInstruction(LLVMGetSuccessor(next, 0));
             while (next && LLVMGetInstructionOpcode(next) == LLVMPHI)
                next = LLVMGetNextInstruction(next);

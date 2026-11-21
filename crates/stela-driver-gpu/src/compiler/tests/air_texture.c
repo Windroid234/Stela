@@ -940,6 +940,36 @@ deferred_slices_are_written_by_their_group(void)
    assert(intrinsics(shader, nir_intrinsic_shared_atomic_swap) == 2);
    assert(intrinsics(shader, nir_intrinsic_shared_atomic) == 2);
    assert(intrinsics(shader, nir_intrinsic_image_deref_store) == 4);
+   /* Imageblock pixel loads from an 8-byte v4f16 element stay 8-byte aligned
+    * rather than splitting into four 16-bit shared loads. */
+   unsigned aligned_pixel_loads = 0;
+   nir_foreach_function_impl(impl, shader) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type != nir_instr_type_intrinsic)
+               continue;
+            nir_intrinsic_instr *intrin = nir_instr_as_intrinsic(instr);
+            if (intrin->intrinsic == nir_intrinsic_load_shared &&
+                intrin->def.num_components == 4 && intrin->def.bit_size == 16) {
+               assert(nir_intrinsic_align_mul(intrin) >= 8);
+               aligned_pixel_loads++;
+            }
+         }
+      }
+   }
+   assert(aligned_pixel_loads == 4);
+   ralloc_free(shader);
+   /* A slice write inside a nested branch whose merge jumps straight to the
+    * barrier still defers to its group. */
+   const char *nested = replace(deferred_slice_body, "AFTER_FIRST",
+                                "br label %nested_end\nnested_end:\n");
+   shader = kernel_with(nested, imageblock_metadata, &o, &error);
+   if (!shader)
+      fprintf(stderr, "nested deferred slices: %u %s\n", error.kind, error.detail);
+   assert(shader);
+   nir_validate_shader(shader, "nested deferred slices");
+   assert(intrinsics(shader, nir_intrinsic_shared_atomic_swap) == 2);
+   assert(intrinsics(shader, nir_intrinsic_image_deref_store) == 4);
    ralloc_free(shader);
    /* The thread does more after the write: it writes the slice alone. */
    const char *busy = replace(deferred_slice_body, "AFTER_FIRST",
@@ -2223,10 +2253,11 @@ frozen_texture_reads_keep_their_lanes(void)
 }
 
 /* Two samples of one texture that may have two planes: each branches to
- * its planes, and both convert them with the texture's one conversion,
- * computed ahead of the first branch, rather than each in its branch. */
+ * its planes and keeps YCbCr conversion inside the non-XR two-plane branch,
+ * so single-plane and extended-range paths neither execute it nor pin its
+ * values in registers across samples. */
 static void
-two_plane_samples_share_their_conversion(void)
+two_plane_samples_keep_conversion_in_ycbcr_branch(void)
 {
    static const char *body =
       "define void @kernel(i32 %tid, ptr addrspace(1) %src, ptr addrspace(2) %smp,"
@@ -2256,21 +2287,80 @@ two_plane_samples_share_their_conversion(void)
    /* Each sample takes a texel of each plane, or one of its only plane, at
     * the base level outside fragment functions. */
    assert(count(shader).tex[nir_texop_txl] == 6);
-   unsigned video = 0;
-   nir_foreach_function_impl(impl, shader) {
-      nir_foreach_block(block, impl) {
-         nir_foreach_instr(instr, block) {
-            if (instr->type != nir_instr_type_alu || nir_instr_as_alu(instr)->op != nir_op_iand)
-               continue;
-            nir_alu_instr *alu = nir_instr_as_alu(instr);
-            for (unsigned i = 0; i < 2; i++)
-               video += nir_src_is_const(alu->src[i].src) &&
-                        nir_src_comp_as_uint(alu->src[i].src, alu->src[i].swizzle[0]) ==
-                           STELA_AIR_PLANES_VIDEO;
+   nir_function_impl *impl = nir_shader_get_entrypoint(shader);
+   nir_block *start = nir_start_block(impl);
+   unsigned video_in_start = 0, video_total = 0;
+   nir_foreach_block(block, impl) {
+      nir_foreach_instr(instr, block) {
+         if (instr->type != nir_instr_type_alu || nir_instr_as_alu(instr)->op != nir_op_iand)
+            continue;
+         nir_alu_instr *alu = nir_instr_as_alu(instr);
+         for (unsigned i = 0; i < 2; i++) {
+            if (nir_src_is_const(alu->src[i].src) &&
+                nir_src_comp_as_uint(alu->src[i].src, alu->src[i].swizzle[0]) ==
+                   STELA_AIR_PLANES_VIDEO) {
+               video_total++;
+               if (block == start)
+                  video_in_start++;
+            }
          }
       }
    }
-   assert(video == 1);
+   assert(video_in_start == 0 && video_total == 2);
+   ralloc_free(shader);
+}
+
+/* A two-plane texture read branches between extended-range (one extra txf)
+ * and YCbCr (4-tap upsampling + txs), never running both on the same path. */
+static void
+two_plane_reads_branch_between_xr_and_ycbcr(void)
+{
+   static const char *body =
+      "define void @kernel(i32 %tid, ptr addrspace(1) %src, ptr addrspace(2) %smp,"
+      " ptr addrspace(1) %dst, ptr addrspace(1) %layers, ptr addrspace(1) %out) {\n"
+      "%r = call { <4 x float>, i8 } @air.read_texture_2d.v4f32(ptr addrspace(1) %src,"
+      " <2 x i32> <i32 1, i32 2>, i32 0, i32 0)\n"
+      "%t = extractvalue { <4 x float>, i8 } %r, 0\n"
+      "call void @air.write_texture_2d.v4f32(ptr addrspace(1) %dst, <2 x i32> <i32 1, i32 2>,"
+      " <4 x float> %t, i32 0, i32 2)\n"
+      "ret void\n}\n";
+   struct stela_air_options o = options(&primary, true);
+   o.texture_planes = stela_metal_texture_planes;
+   o.dynamic_planes = true;
+   struct stela_air_error error = {0};
+   nir_shader *shader = kernel_with(body, kernel_metadata, &o, &error);
+   if (!shader)
+      fprintf(stderr, "two-plane read: %s\n", error.detail);
+   assert(shader);
+   nir_validate_shader(shader, "two-plane read xr branch");
+   /* Entry block has neither the 4-tap upsampling txs nor XR10 pow(). */
+   nir_function_impl *impl = nir_shader_get_entrypoint(shader);
+   nir_block *start = nir_start_block(impl);
+   unsigned txs_in_start = 0, pow_in_start = 0, txs_total = 0;
+   nir_foreach_block(block, impl) {
+      nir_foreach_instr(instr, block) {
+         if (instr->type == nir_instr_type_tex && nir_instr_as_tex(instr)->op == nir_texop_txs) {
+            txs_total++;
+            if (block == start)
+               txs_in_start++;
+         }
+         if (instr->type == nir_instr_type_alu && nir_instr_as_alu(instr)->op == nir_op_fpow &&
+             block == start)
+            pow_in_start++;
+      }
+   }
+   assert(txs_in_start == 0 && pow_in_start == 0 && txs_total == 1);
+   /* txs (YCbCr upsampling) and XR10 fpow must not live in the same block. */
+   nir_foreach_block(block, impl) {
+      bool has_txs = false, has_pow = false;
+      nir_foreach_instr(instr, block) {
+         has_txs |= instr->type == nir_instr_type_tex &&
+                    nir_instr_as_tex(instr)->op == nir_texop_txs;
+         has_pow |= instr->type == nir_instr_type_alu &&
+                    nir_instr_as_alu(instr)->op == nir_op_fpow;
+      }
+      assert(!(has_txs && has_pow));
+   }
    ralloc_free(shader);
 }
 
@@ -2306,6 +2396,14 @@ extended_storage_writes_hold_their_codes(void)
          }
       }
       assert(narrowed == (queried ? 4 : 0));
+      /* Extended-range quantization stays behind a branch, never in the
+       * entry block of a normal texture write. */
+      nir_block *start = nir_start_block(nir_shader_get_entrypoint(shader));
+      nir_foreach_instr(instr, start) {
+         assert(!(instr->type == nir_instr_type_alu &&
+                  (nir_instr_as_alu(instr)->op == nir_op_f2f16_rtne ||
+                   nir_instr_as_alu(instr)->op == nir_op_fpow)));
+      }
       ralloc_free(shader);
    }
 }
@@ -2387,7 +2485,8 @@ main(void)
    uniform_branches_keep_their_derivatives();
    early_returns_take_derivatives_before_the_branch();
    guarded_reads_keep_their_derivatives();
-   two_plane_samples_share_their_conversion();
+   two_plane_samples_keep_conversion_in_ycbcr_branch();
+   two_plane_reads_branch_between_xr_and_ycbcr();
    frozen_texture_reads_keep_their_lanes();
    glsl_type_singleton_decref();
    puts("AIR textures: sample/level/offset, write, read_write array read, size queries, "

@@ -792,8 +792,9 @@ texture_planes(const struct call *call)
  * a 16-bit word, whose low 6 bits Apple GPUs ignore. The first plane's then
  * converts as (step + luma_bias) * luma_scale, the second's as (step +
  * chroma_bias) * chroma_scale: luma and chroma where `ycbcr`, else green
- * and blue and red over the largest step. Computed once ahead of the
- * branch to the planes, a function's samples of one texture share them. */
+ * and blue and red over the largest step. Computed inside the non-XR
+ * two-plane branch so single-plane and extended-range paths neither execute
+ * it nor pin its values in registers across taps. */
 struct planes_conversion {
    nir_def *ten, *ycbcr, *xr, *xr_srgb;
    nir_def *steps;
@@ -869,6 +870,18 @@ planes_color(nir_builder *b, nir_def *first, nir_def *second, const struct plane
  * below zero where xr_srgb; alpha is the second's. A filtered sample
  * filters the codes, which the linear values follow exactly. */
 static nir_def *
+xr_planes_srgb_decode(nir_builder *b, nir_def *v)
+{
+   nir_def *m = nir_fabs(b, v);
+   nir_def *curve = nir_fpow(b, nir_fmul_imm(b, nir_fadd_imm(b, m, 0.055), 1.0 / 1.055),
+                             nir_replicate(b, nir_imm_float(b, 2.4f), 3));
+   nir_def *linear = nir_bcsel(b, nir_fge(b, nir_replicate(b, nir_imm_float(b, 0.04045f), 3), m),
+                               nir_fmul_imm(b, m, 1.0 / 12.92), curve);
+   return nir_bcsel(b, nir_flt(b, v, nir_replicate(b, nir_imm_float(b, 0.0f), 3)),
+                    nir_fneg(b, linear), linear);
+}
+
+static nir_def *
 xr_planes_color(nir_builder *b, nir_def *first, nir_def *second, const struct planes_conversion *c,
                 bool read)
 {
@@ -876,14 +889,34 @@ xr_planes_color(nir_builder *b, nir_def *first, nir_def *second, const struct pl
    if (read)
       codes = nir_fround_even(b, codes);
    nir_def *v = nir_fmul_imm(b, nir_fadd_imm(b, codes, -384.0), 1.0 / 510.0);
-   nir_def *m = nir_fabs(b, v);
-   nir_def *curve = nir_fpow(b, nir_fmul_imm(b, nir_fadd_imm(b, m, 0.055), 1.0 / 1.055),
-                             nir_replicate(b, nir_imm_float(b, 2.4f), 3));
-   nir_def *linear = nir_bcsel(b, nir_fge(b, nir_replicate(b, nir_imm_float(b, 0.04045f), 3), m),
-                               nir_fmul_imm(b, m, 1.0 / 12.92), curve);
-   linear = nir_bcsel(b, nir_flt(b, v, nir_replicate(b, nir_imm_float(b, 0.0f), 3)),
-                      nir_fneg(b, linear), linear);
-   v = nir_bcsel(b, c->xr_srgb, linear, v);
+   v = nir_bcsel(b, c->xr_srgb, xr_planes_srgb_decode(b, v), v);
+   return nir_vec4(b, nir_channel(b, v, 2), nir_channel(b, v, 1), nir_channel(b, v, 0),
+                   nir_channel(b, second, 0));
+}
+
+/* Same as xr_planes_color, branching on xr_srgb when the caller can branch
+ * so linear XR10 textures skip the three pow(x, 2.4) curves. */
+static nir_def *
+xr_planes_color_branched(const struct call *call, nir_def *first, nir_def *second,
+                         const struct planes_conversion *c, bool read)
+{
+   nir_builder *b = call->b;
+   nir_def *codes = nir_fmul_imm(b, nir_trim_vector(b, first, 3), 1023.0);
+   if (read)
+      codes = nir_fround_even(b, codes);
+   nir_def *v = nir_fmul_imm(b, nir_fadd_imm(b, codes, -384.0), 1.0 / 510.0);
+   if (call->c->branch) {
+      nir_block *blocks[4];
+      if (!call->c->branch(call->c->translator, c->xr_srgb, blocks))
+         return NULL;
+      nir_def *decoded = xr_planes_srgb_decode(b, v);
+      call->c->branch_else(call->c->translator, blocks);
+      v = call->c->branch_join(call->c->translator, blocks, decoded, v);
+      if (!v)
+         return NULL;
+   } else {
+      v = nir_bcsel(b, c->xr_srgb, xr_planes_srgb_decode(b, v), v);
+   }
    return nir_vec4(b, nir_channel(b, v, 2), nir_channel(b, v, 1), nir_channel(b, v, 0),
                    nir_channel(b, second, 0));
 }
@@ -1068,13 +1101,32 @@ sample(struct call *call, enum operation op, nir_def **result)
       nir_def *planes = texture_planes(call);
       if (!planes)
          return false;
-      struct planes_conversion conversion = planes_conversion(call->b, planes);
       if (!c->branch(c->translator, nir_ine_imm(call->b, planes, 0), blocks))
          return false;
       struct tex second = t;
       if (!(second.texture = bind_texture(call, descriptor_type(call->texture), true, NULL)))
          return false;
-      nir_def *combined = planes_rgba(call->b, emit(call, &t), emit(call, &second), &conversion);
+      nir_def *first_texel = emit(call, &t), *second_texel = emit(call, &second);
+      nir_def *xr = nir_test_mask(call->b, planes, STELA_AIR_PLANES_XR10);
+      nir_block *xr_blocks[4];
+      if (!c->branch(c->translator, xr, xr_blocks))
+         return false;
+      struct planes_conversion xr_conv = {
+         .xr = xr,
+         .xr_srgb = nir_test_mask(call->b, planes, STELA_AIR_PLANES_XR10_SRGB),
+      };
+      nir_def *xr_val =
+         xr_planes_color_branched(call, first_texel, second_texel, &xr_conv, false);
+      if (!xr_val)
+         return false;
+      c->branch_else(c->translator, xr_blocks);
+      struct planes_conversion conversion = planes_conversion(call->b, planes);
+      nir_def *ycbcr_val =
+         planes_color(call->b, plane_steps(call->b, first_texel, &conversion, false),
+                      plane_steps(call->b, second_texel, &conversion, false), &conversion);
+      nir_def *combined = c->branch_join(c->translator, xr_blocks, xr_val, ycbcr_val);
+      if (!combined)
+         return false;
       c->branch_else(c->translator, blocks);
       nir_def *single = one_sample(call, &t, compare);
       if (!single || !(value = c->branch_join(c->translator, blocks, combined, single)))
@@ -1297,20 +1349,58 @@ extended_storage(const struct call *call, nir_def *texel)
    if (!kind)
       return texel;
    nir_builder *b = call->b;
-   /* Translated control flow is unstructured: the texel selects its form. */
    nir_def *held_kind = nir_ine_imm(b, kind, STELA_AIR_EXTENDED_STORAGE_NONE);
    nir_def *srgb = nir_ieq_imm(b, kind, STELA_AIR_EXTENDED_STORAGE_SRGB);
+   const struct stela_air_texture_context *c = call->c;
+   if (c->branch) {
+      nir_block *outer[4];
+      if (!c->branch(c->translator, held_kind, outer))
+         return NULL;
+      unsigned color_count = MIN2(texel->num_components, 3);
+      nir_block *inner[4];
+      if (!c->branch(c->translator, srgb, inner))
+         return NULL;
+      nir_def *srgb_rgb[3];
+      for (unsigned i = 0; i < color_count; i++)
+         srgb_rgb[i] =
+            stela_air_extended_range_code(b, nir_channel(b, texel, i), true, 0.0f, 1023.0f);
+      nir_def *srgb_vec = nir_vec(b, srgb_rgb, color_count);
+      c->branch_else(c->translator, inner);
+      nir_def *lin_rgb[3];
+      for (unsigned i = 0; i < color_count; i++)
+         lin_rgb[i] =
+            stela_air_extended_range_code(b, nir_channel(b, texel, i), false, 0.0f, 1023.0f);
+      nir_def *lin_vec = nir_vec(b, lin_rgb, color_count);
+      nir_def *coded = c->branch_join(c->translator, inner, srgb_vec, lin_vec);
+      if (!coded)
+         return NULL;
+      nir_def *channels[NIR_MAX_VEC_COMPONENTS];
+      for (unsigned i = 0; i < texel->num_components; i++) {
+         nir_def *ch;
+         if (i < 3) {
+            ch = nir_channel(b, coded, i);
+         } else {
+            nir_def *steps =
+               nir_fround_even(b, nir_fmul_imm(b, nir_fsat(b, nir_channel(b, texel, i)), 255.0));
+            ch = nir_fmul_imm(b, steps, 1.0 / 255.0);
+         }
+         channels[i] = nir_f2f32(b, nir_f2f16_rtne(b, ch));
+      }
+      nir_def *held = nir_vec(b, channels, texel->num_components);
+      c->branch_else(c->translator, outer);
+      return c->branch_join(c->translator, outer, held, texel);
+   }
    nir_def *channels[NIR_MAX_VEC_COMPONENTS];
    for (unsigned i = 0; i < texel->num_components; i++) {
-      nir_def *c = nir_channel(b, texel, i);
+      nir_def *ch = nir_channel(b, texel, i);
       if (i < 3) {
-         c = nir_bcsel(b, srgb, stela_air_extended_range_code(b, c, true, 0.0f, 1023.0f),
-                       stela_air_extended_range_code(b, c, false, 0.0f, 1023.0f));
+         ch = nir_bcsel(b, srgb, stela_air_extended_range_code(b, ch, true, 0.0f, 1023.0f),
+                        stela_air_extended_range_code(b, ch, false, 0.0f, 1023.0f));
       } else {
-         nir_def *steps = nir_fround_even(b, nir_fmul_imm(b, nir_fsat(b, c), 255.0));
-         c = nir_fmul_imm(b, steps, 1.0 / 255.0);
+         nir_def *steps = nir_fround_even(b, nir_fmul_imm(b, nir_fsat(b, ch), 255.0));
+         ch = nir_fmul_imm(b, steps, 1.0 / 255.0);
       }
-      channels[i] = nir_f2f32(b, nir_f2f16_rtne(b, c));
+      channels[i] = nir_f2f32(b, nir_f2f16_rtne(b, ch));
    }
    return nir_bcsel(b, held_kind, nir_vec(b, channels, texel->num_components), texel);
 }
@@ -1334,16 +1424,36 @@ extended_read(const struct call *call, nir_def *texel)
       return texel;
    nir_builder *b = call->b;
    nir_def *held_kind = nir_ieq_imm(b, kind, STELA_AIR_EXTENDED_STORAGE_CODES);
+   const struct stela_air_texture_context *c = call->c;
+   if (c->branch) {
+      nir_block *blocks[4];
+      if (!c->branch(c->translator, held_kind, blocks))
+         return NULL;
+      nir_def *channels[NIR_MAX_VEC_COMPONENTS];
+      for (unsigned i = 0; i < texel->num_components; i++) {
+         nir_def *ch = nir_channel(b, texel, i);
+         if (i < 3) {
+            ch = stela_air_extended_range_code(b, ch, false, 0.0f, 1023.0f);
+         } else {
+            nir_def *steps = nir_fround_even(b, nir_fmul_imm(b, nir_fsat(b, ch), 255.0));
+            ch = nir_fmul_imm(b, steps, 1.0 / 255.0);
+         }
+         channels[i] = ch;
+      }
+      nir_def *held = nir_vec(b, channels, texel->num_components);
+      c->branch_else(c->translator, blocks);
+      return c->branch_join(c->translator, blocks, held, texel);
+   }
    nir_def *channels[NIR_MAX_VEC_COMPONENTS];
    for (unsigned i = 0; i < texel->num_components; i++) {
-      nir_def *c = nir_channel(b, texel, i);
+      nir_def *ch = nir_channel(b, texel, i);
       if (i < 3) {
-         c = stela_air_extended_range_code(b, c, false, 0.0f, 1023.0f);
+         ch = stela_air_extended_range_code(b, ch, false, 0.0f, 1023.0f);
       } else {
-         nir_def *steps = nir_fround_even(b, nir_fmul_imm(b, nir_fsat(b, c), 255.0));
-         c = nir_fmul_imm(b, steps, 1.0 / 255.0);
+         nir_def *steps = nir_fround_even(b, nir_fmul_imm(b, nir_fsat(b, ch), 255.0));
+         ch = nir_fmul_imm(b, steps, 1.0 / 255.0);
       }
-      channels[i] = c;
+      channels[i] = ch;
    }
    return nir_bcsel(b, held_kind, nir_vec(b, channels, texel->num_components), texel);
 }
@@ -1357,8 +1467,11 @@ static nir_def *
 srgb_storage(const struct call *call, nir_def *texel, bool encode)
 {
    const struct stela_air_options *options = call->c->options;
-   if (encode)
+   if (encode) {
       texel = extended_storage(call, texel);
+      if (!texel)
+         return NULL;
+   }
    if (base_type(call->texture) != GLSL_TYPE_FLOAT || !options->texture_srgb_storage)
       return texel;
    nir_def *srgb = options->texture_srgb_storage(
@@ -1366,15 +1479,32 @@ srgb_storage(const struct call *call, nir_def *texel, bool encode)
    if (!srgb)
       return texel;
    nir_builder *b = call->b;
+   const struct stela_air_texture_context *c = call->c;
+   if (c->branch) {
+      nir_block *blocks[4];
+      if (!c->branch(c->translator, srgb, blocks))
+         return NULL;
+      nir_def *channels[NIR_MAX_VEC_COMPONENTS];
+      for (unsigned i = 0; i < texel->num_components; i++) {
+         nir_def *ch = nir_channel(b, texel, i);
+         if (i < 3)
+            ch = encode ? nir_format_linear_to_srgb(b, nir_fsat(b, ch))
+                        : nir_format_srgb_to_linear(b, ch);
+         channels[i] = ch;
+      }
+      nir_def *converted = nir_vec(b, channels, texel->num_components);
+      c->branch_else(c->translator, blocks);
+      return c->branch_join(c->translator, blocks, converted, texel);
+   }
    nir_def *channels[NIR_MAX_VEC_COMPONENTS];
    for (unsigned i = 0; i < texel->num_components; i++) {
-      nir_def *c = nir_channel(b, texel, i);
+      nir_def *ch = nir_channel(b, texel, i);
       if (i < 3) {
          nir_def *converted =
-            encode ? nir_format_linear_to_srgb(b, nir_fsat(b, c)) : nir_format_srgb_to_linear(b, c);
-         c = nir_bcsel(b, srgb, converted, c);
+            encode ? nir_format_linear_to_srgb(b, nir_fsat(b, ch)) : nir_format_srgb_to_linear(b, ch);
+         ch = nir_bcsel(b, srgb, converted, ch);
       }
-      channels[i] = c;
+      channels[i] = ch;
    }
    return nir_vec(b, channels, texel->num_components);
 }
@@ -1470,20 +1600,34 @@ read_texel(struct call *call, nir_def **result)
          nir_def *planes = texture_planes(call);
          if (!planes)
             return false;
-         struct planes_conversion conversion = planes_conversion(b, planes);
          if (!c->branch(c->translator, nir_ine_imm(b, planes, 0), blocks))
             return false;
          struct tex second = t;
          if (!(second.texture = bind_texture(call, descriptor_type(texture), true, NULL)))
             return false;
          nir_def *first = emit(call, &t);
-         nir_def *combined =
+         /* An extended-range texture's planes hold a texel each; skip the
+          * 4-tap chroma upsampling and YCbCr conversion when reading one. */
+         nir_def *xr = nir_test_mask(b, planes, STELA_AIR_PLANES_XR10);
+         nir_block *xr_blocks[4];
+         if (!c->branch(c->translator, xr, xr_blocks))
+            return false;
+         struct planes_conversion xr_conv = {
+            .xr = xr,
+            .xr_srgb = nir_test_mask(b, planes, STELA_AIR_PLANES_XR10_SRGB),
+         };
+         nir_def *xr_val =
+            xr_planes_color_branched(call, first, emit(call, &second), &xr_conv, true);
+         if (!xr_val)
+            return false;
+         c->branch_else(c->translator, xr_blocks);
+         struct planes_conversion conversion = planes_conversion(b, planes);
+         nir_def *ycbcr_val =
             planes_color(b, plane_steps(b, first, &conversion, true),
                          planes_upsampled(call, &second, coord, planes, &conversion), &conversion);
-         /* An extended-range texture's planes hold a texel each. */
-         combined = nir_bcsel(b, conversion.xr,
-                              xr_planes_color(b, first, emit(call, &second), &conversion, true),
-                              combined);
+         nir_def *combined = c->branch_join(c->translator, xr_blocks, xr_val, ycbcr_val);
+         if (!combined)
+            return false;
          c->branch_else(c->translator, blocks);
          if (!(value = c->branch_join(c->translator, blocks, combined, emit(call, &t))))
             return false;
@@ -1492,9 +1636,10 @@ read_texel(struct call *call, nir_def **result)
       }
    }
    value = resident(call, value);
-   if (image)
-      value = srgb_storage(call, value, false);
-   value = extended_read(call, value);
+   if (image && !(value = srgb_storage(call, value, false)))
+      return false;
+   if (!(value = extended_read(call, value)))
+      return false;
    *result = texel(call, value, false);
    return true;
 }
@@ -1585,7 +1730,7 @@ write_texel(struct call *call)
    nir_def *level;
    nir_deref_instr *deref;
    if (!value || !image_level(call, &level) || !access_operand(call, texture->access) ||
-       !finished(call) || !(deref = texture_deref(call, level)))
+       !finished(call))
       return false;
    nir_builder *b = call->b;
    switch (texture->primitive) {
@@ -1595,6 +1740,8 @@ write_texel(struct call *call)
    default: break;
    }
    value = srgb_storage(call, value, true);
+   if (!value || !(deref = texture_deref(call, level)))
+      return false;
    nir_image_deref_store(b, &deref->def, image_coord(call, position, face, layer),
                          nir_undef(b, 1, 32), value, nir_imm_int(b, 0), .image_dim = shape->dim,
                          .image_array = shape->array, .access = image_access(call, level),
@@ -1657,9 +1804,7 @@ slice_pixel(void *data, nir_def *index, nir_def **values)
    nir_def *value = call->c->imageblock_load(call->c->translator, slice->member,
                                              slice->member_offset, pixel, slice->components,
                                              slice->bits);
-   /* Derefs stay in the block that uses them. */
-   nir_deref_instr *deref = value ? texture_deref(call, slice->level) : NULL;
-   if (!deref)
+   if (!value)
       return false;
    bool is_signed = base_type(call->texture) == GLSL_TYPE_INT;
    value = slice->floating ? nir_f2f32(b, value) : is_signed ? nir_i2i32(b, value) :
@@ -1671,6 +1816,10 @@ slice_pixel(void *data, nir_def *index, nir_def **values)
    nir_def *at = nir_iadd(b, slice->position, nir_vec2(b, x, y));
    nir_def *texel = slice->floating ? srgb_storage(call, nir_vec(b, lanes, 4), true) :
                                       nir_vec(b, lanes, 4);
+   /* Derefs stay in the block that uses them. */
+   nir_deref_instr *deref = texel ? texture_deref(call, slice->level) : NULL;
+   if (!deref)
+      return false;
    nir_image_deref_store(b, &deref->def, image_coord(call, at, NULL, NULL), nir_undef(b, 1, 32),
                          texel, nir_imm_int(b, 0),
                          .image_dim = GLSL_SAMPLER_DIM_2D, .image_array = false,
