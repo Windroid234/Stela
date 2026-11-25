@@ -1886,6 +1886,28 @@ pub unsafe fn open(
     Vec::leak(core::mem::take(&mut devices.ehci_hosts));
     for host in &devices.hda_hosts {
         let location = &host.location;
+        if let Some(state) = host.wake.from_state {
+            let state = match state {
+                3 => "D3hot",
+                2 => "D2",
+                _ => "D1",
+            };
+            output::arguments(format_args!(
+                "HOST HD AUDIO {location}: woke the controller from {state} to D0\n"
+            ));
+        }
+        if host.wake.decode_enabled {
+            output::arguments(format_args!(
+                "HOST HD AUDIO {location}: turned on the memory decoding firmware left off\n"
+            ));
+        }
+        if let Some(unheld) = host.unheld {
+            output::arguments(format_args!(
+                "HOST HD AUDIO {location}: config byte {:#04x} did not take the snoop bits \
+                 {:#04x} (reads {:#04x}); Linux never checks it, so Stela went on\n",
+                unheld.offset, unheld.wanted, unheld.read
+            ));
+        }
         for codec in &host.codecs {
             let graph = &codec.graph;
             match &codec.setup {
@@ -1911,9 +1933,11 @@ pub unsafe fn open(
             ));
         }
     }
-    // HD Audio controllers stay attached for the boot; no guest audio device
-    // consumes them yet.
-    Vec::leak(core::mem::take(&mut devices.hda_hosts));
+    let host_audio = super::audio::HostAudio::first(
+        core::mem::take(&mut devices.hda_hosts),
+        root,
+        handoff.clock,
+    );
     // A USB device can connect, train its link and answer its first
     // commands after its controller's start looked at the ports: the
     // partitions this boot needs are waited for while the USB hosts report
@@ -2386,6 +2410,7 @@ pub unsafe fn open(
             core::mem::take(&mut devices.pcie_bluetooth),
             root,
         ),
+        audio: host_audio,
         gpus: core::mem::take(&mut devices.gpus),
         gpu_companions: core::mem::take(&mut devices.gpu_companions),
         isa_bridges: core::mem::take(&mut devices.isa_bridges),
@@ -2733,6 +2758,8 @@ pub struct Opened {
     pub network_account: alloc::vec::Vec<alloc::string::String>,
     /// The host's Bluetooth controller, for the guest's.
     pub bluetooth: Option<super::bluetooth::HostBluetooth>,
+    /// The host's HD Audio analog playback bridge, behind the guest's USB speaker.
+    pub audio: Option<super::audio::HostAudio>,
     /// The display controllers probe left for their own drivers.
     pub gpus: alloc::vec::Vec<stela_drivers::gpu::Adapter>,
     /// Each display controller's ACPI companion path, where probe found one.

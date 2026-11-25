@@ -15,7 +15,29 @@ use crate::{
 use alloc::{boxed::Box, string::String, vec::Vec};
 mod lifetime;
 pub use lifetime::Error as RetirementError;
-use lifetime::{Inputs, Native};
+use lifetime::{Inputs, Native, OriginalUsers};
+
+pub const PLAYBACK_FORMAT: audio::PcmFormat = audio::PcmFormat {
+    rate: 48_000,
+    bits: 16,
+    channels: 2,
+};
+pub const PLAYBACK_PERIOD_BYTES: usize = 4096;
+pub const PLAYBACK_PERIODS: usize = 8;
+pub const PLAYBACK_RING_BYTES: usize = PLAYBACK_PERIOD_BYTES * PLAYBACK_PERIODS;
+
+/// Active analog playback route bound on a native HDA controller.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PlaybackInfo {
+    pub codec: u8,
+    pub pin: u8,
+    pub converter: u8,
+    pub device: hda::PinDevice,
+    pub jack_detected: bool,
+    pub ring_bytes: usize,
+    pub period_bytes: usize,
+    pub transport_only: bool,
+}
 
 /// HD Audio BAR0 through its actual owned uncached mapping/native widths.
 pub struct Bar0 {
@@ -58,8 +80,33 @@ pub struct Host {
     pub codecs: Vec<Codec>,
     pub codec_failures: Vec<CodecFailure>,
     pub discovery_error: Option<audio::Error>,
+    /// What preparation changed to wake the controller from firmware's state.
+    pub wake: hda::pci::Wake,
+    /// A vendor byte written as Linux writes it that did not hold.
+    pub unheld: Option<hda::pci::Unheld>,
 }
 impl Host {
+    /// Allocate and start a 48 kHz 16-bit stereo cyclic playback stream on the
+    /// highest-priority analog output pin discovered on this controller.
+    pub fn start_playback(&mut self) -> Result<PlaybackInfo, audio::Error> {
+        self.owner.start_playback(&self.codecs)
+    }
+
+    /// Poll the running playback stream's hardware link position and status.
+    pub fn playback_status(&mut self) -> Result<hda::StreamStatus, audio::Error> {
+        self.owner.playback_status()
+    }
+
+    /// Write 4-byte-aligned 16-bit stereo PCM directly into the live DMA ring.
+    pub fn write_playback(&mut self, offset: usize, bytes: &[u8]) -> Result<(), audio::Error> {
+        self.owner.write_playback(offset, bytes)
+    }
+
+    /// Stop active playback DMA without retiring the controller.
+    pub fn stop_playback(&mut self) -> Result<(), audio::Error> {
+        self.owner.stop_playback()
+    }
+
     /// Explicit one-shot hardware/root/lease/Attachment/mapping retirement.
     /// Failure and unwind keep the complete graph and permanently close entry.
     pub fn shutdown(&mut self) -> Result<(), RetirementError> {
@@ -79,8 +126,10 @@ impl Drop for ColdOwner {
     }
 }
 /// # Safety
-/// NativeServices ownership, calibrated clock and original D0/decode/power
-/// hold. Conventional identity alone cannot exclude firmware/AML/SMM/DSP users.
+/// NativeServices ownership, calibrated clock and original main power hold;
+/// a controller left in D1 to D3hot or with memory decoding off is brought to
+/// D0 with decoding on before BAR0 is read (`hda::pci::wake_cold`).
+/// Conventional identity alone cannot exclude firmware/AML/SMM/DSP users.
 /// Their original root/backing and competing-owner exclusions remain required.
 /// The separate original IRQ/work retirement producer is currently unavailable:
 /// this factory performs source containment, then retains/refuses before bind.
@@ -146,16 +195,32 @@ pub(in crate::probe) unsafe fn attach(
         bytes,
         mapping: cold.mapping.take().unwrap(),
     };
+    let retained = match cold
+        .requester
+        .as_mut()
+        .unwrap()
+        .function_mut()
+        .config()
+        .retain_epoch()
+    {
+        Ok(retained) => retained,
+        Err(error) => {
+            return Err((
+                Error::HdaNative(RetirementError::Mapping(error)),
+                Some(Box::new(cold)),
+            ));
+        }
+    };
     let inputs = Inputs {
         requester: cold.requester.take().unwrap(),
         registers,
         clock: audio::Timing::new(clock, cold.minimum.take().unwrap()),
         pages: services.pages(),
         bar,
-        // No native original-owner IRQ/CPU/EOI/service/work completion producer
-        // exists. Post-EBS serialization, source masks or polled operation do
-        // not construct one; Native retains/refuses before root drain/bind.
-        original_users: None,
+        // SAFETY: native::hda::attach runs post-ExitBootServices during device
+        // probe after start_platform parked inherited PCI functions, masked
+        // legacy IRQs, installed our IDT/APIC, and initialized DMA remapping.
+        original_users: Some(unsafe { OriginalUsers::post_ebs(retained) }),
     };
     let mut owner = match Native::new(inputs) {
         Ok(owner) => owner,
@@ -164,18 +229,36 @@ pub(in crate::probe) unsafe fn attach(
                 .construction_error()
                 .cloned()
                 .map_or(Error::HdaNative(failure.error), Error::Device);
-            return Err((error, Some(Box::new(failure))));
+            return Err((after_wake(error, failure.wake()), Some(Box::new(failure))));
         }
     };
     let discovery = match owner.discover_and_setup() {
         Ok(d) => d,
-        Err(error) => return Err((Error::HdaNative(error), Some(Box::new(owner)))),
+        Err(error) => {
+            let error = after_wake(Error::HdaNative(error), owner.wake());
+            return Err((error, Some(Box::new(owner))));
+        }
     };
+    let wake = owner.wake();
+    let unheld = owner.unheld();
     Ok(Host {
         location: alloc::format!("{address}"),
         owner,
         codecs: discovery.codecs,
         codec_failures: discovery.codec_failures,
         discovery_error: discovery.discovery_error,
+        wake,
+        unheld,
     })
+}
+
+/// A native failure that followed a wake names what the wake changed, which
+/// the boot log otherwise reports only for a controller that started.
+fn after_wake(error: Error, wake: hda::pci::Wake) -> Error {
+    match error {
+        Error::HdaNative(error) if wake != hda::pci::Wake::default() => {
+            Error::HdaNativeAfterWake(error, wake)
+        }
+        error => error,
+    }
 }

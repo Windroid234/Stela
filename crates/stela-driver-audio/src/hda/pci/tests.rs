@@ -333,6 +333,8 @@ mod owned_models;
 
 mod access_failures;
 
+mod wake;
+
 // SAFETY: this private synchronous peripheral model measures virtual microseconds;
 // no physical timer, CPU or native hardware permission follows from it.
 unsafe impl crate::bus::pci::power::Timer for Clock {

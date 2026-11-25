@@ -237,7 +237,7 @@ fn final_enable_failure_keeps_the_published_prefix_without_cleanup() {
     function.config().fail_after_enable = true;
     assert_eq!(
         prepare_model(&mut function, &timer, bar).unwrap_err(),
-        AttachError::ConfigurationRejected
+        AttachError::rejected("decoding on", regs::COMMAND, Some(0x406), 0xffff)
     );
     let config = function.config();
     assert!(
@@ -280,7 +280,12 @@ fn rejected_decode_stops_preparation() {
     function.config().reject_command = true;
     assert_eq!(
         prepare_model(&mut function, &timer, bar).unwrap_err(),
-        AttachError::ConfigurationRejected
+        AttachError::rejected(
+            "decoding and bus mastering off",
+            regs::COMMAND,
+            Some(0x400),
+            0x406
+        )
     );
     assert!(
         function
@@ -309,10 +314,11 @@ fn rejected_controls_disable_mastering() {
         let result = prepare_model(&mut function, &timer, bar).unwrap_err();
         assert_eq!(
             result,
-            if failure == 0 {
-                AttachError::PowerTransition
-            } else {
-                AttachError::ConfigurationRejected
+            match failure {
+                0 => AttachError::PowerTransition,
+                // TCSEL 0xf7 with its low three bits cleared did not stick.
+                1 => AttachError::rejected("vendor control", TCSEL, Some(0xf0), 0xf7),
+                _ => AttachError::rejected("decoding on", regs::COMMAND, Some(0x406), 0x400),
             }
         );
         assert_eq!(

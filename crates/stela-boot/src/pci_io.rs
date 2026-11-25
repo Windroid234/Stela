@@ -408,6 +408,15 @@ impl PciIo {
         })?;
         Ok(header)
     }
+    /// Configuration bytes 0x40 to 0xff, read the same way as the header.
+    pub fn read_tail(&mut self) -> Result<[u8; 192], Error> {
+        let mut tail = [0; 192];
+        // Width0=EfiPciIoWidthUint8 from offset 64; no raw ECAM access.
+        // SAFETY: live boot protocol and bounded writable local output; the
+        // firmware performs its own controller/configuration addressing.
+        status(unsafe { (self.config_read)(self, 0, 64, tail.len(), tail.as_mut_ptr().cast()) })?;
+        Ok(tail)
+    }
     pub fn bar_regions(&mut self, index: u8) -> Result<Vec<BarRegion>, Error> {
         if index >= 6 {
             return Err(Error::BarIndex);
@@ -505,6 +514,9 @@ pub struct Census {
 pub struct FunctionObservation {
     pub address: Address,
     pub header: [u8; 64],
+    /// An HD Audio function's configuration bytes 0x40 to 0xff, for the
+    /// census: the state firmware left it in, before any driver writes.
+    pub audio_tail: Option<[u8; 192]>,
     // A missing/unimplemented BAR is preserved as the firmware status;
     // it is not turned into an empty device or a guessed identity translation.
     pub bars: [Result<Vec<BarRegion>, Error>; 6],
@@ -586,6 +598,11 @@ pub fn capture() -> Result<Census, CaptureFailure> {
                 continue;
             }
         };
+        // Base class 04, subclass 03: HD Audio. A refused read only loses
+        // the census dump.
+        let audio_tail = (header[0x0b] == 0x04 && header[0x0a] == 0x03)
+            .then(|| protocol.read_tail().ok())
+            .flatten();
         let bars = core::array::from_fn(|bar| protocol.bar_regions(bar as u8));
         // FreePool refusal cannot be followed by EBS as though reclamation had
         // succeeded. Caller stops preparation with the status kept.
@@ -598,6 +615,7 @@ pub fn capture() -> Result<Census, CaptureFailure> {
         result.functions.push(FunctionObservation {
             address,
             header,
+            audio_tail,
             bars,
         });
     }

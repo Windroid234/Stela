@@ -84,6 +84,9 @@ enum Setup {
     IntelIch,
     IntelPch,
     AtiAzalia,
+    /// Zen-family AMD hosts, which take the ATI snoop byte the way Linux
+    /// writes it: without reading it back.
+    AmdZen,
     Nvidia,
 }
 
@@ -91,8 +94,24 @@ enum Setup {
 /// status/vendor fields; in particular Device Status next to DEVC is W1C.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Control {
-    Byte { offset: u16, mask: u8, value: u8 },
-    Word { offset: u16, mask: u16, value: u16 },
+    Byte {
+        offset: u16,
+        mask: u8,
+        value: u8,
+    },
+    Word {
+        offset: u16,
+        mask: u16,
+        value: u16,
+    },
+    /// A byte Linux `update_pci_byte` writes and never reads back: written
+    /// the same way, and not refused when it does not hold
+    /// ([`unheld_control`] reports that).
+    Lenient {
+        offset: u16,
+        mask: u8,
+        value: u8,
+    },
 }
 const PCH_SNOOP: Control = Control::Word {
     offset: SCH_HDA_DEVC,
@@ -102,12 +121,13 @@ const PCH_SNOOP: Control = Control::Word {
 impl Control {
     fn extent(self) -> core::ops::Range<usize> {
         let (offset, bytes) = match self {
-            Self::Byte { offset, .. } => (offset, 1),
+            Self::Byte { offset, .. } | Self::Lenient { offset, .. } => (offset, 1),
             Self::Word { offset, .. } => (offset, 2),
         };
         usize::from(offset)..usize::from(offset + bytes)
     }
     fn apply(self, config: &mut impl ConfigSpace) -> Result<(), AttachError> {
+        const STEP: &str = "vendor control";
         match self {
             Self::Byte {
                 offset,
@@ -116,12 +136,18 @@ impl Control {
             } => {
                 let previous = config.read8(offset)?;
                 if previous == u8::MAX {
-                    return Err(AttachError::ConfigurationRejected);
+                    return Err(AttachError::rejected(STEP, offset, None, 0xff));
                 }
                 let next = previous & !mask | value;
                 config.write8(offset, next)?;
-                if config.read8(offset)? != next {
-                    return Err(AttachError::ConfigurationRejected);
+                let observed = config.read8(offset)?;
+                if observed != next {
+                    return Err(AttachError::rejected(
+                        STEP,
+                        offset,
+                        Some(next.into()),
+                        observed.into(),
+                    ));
                 }
             }
             Self::Word {
@@ -131,7 +157,7 @@ impl Control {
             } => {
                 let previous = config.read16(offset)?;
                 if previous == u16::MAX {
-                    return Err(AttachError::ConfigurationRejected);
+                    return Err(AttachError::rejected(STEP, offset, None, 0xffff));
                 }
                 let next = previous & !mask | value;
                 if next == previous {
@@ -140,8 +166,21 @@ impl Control {
                 config.write16(offset, next)?;
                 let observed = config.read16(offset)?;
                 if observed == u16::MAX || observed != next {
-                    return Err(AttachError::ConfigurationRejected);
+                    return Err(AttachError::rejected(
+                        STEP,
+                        offset,
+                        Some(next.into()),
+                        observed.into(),
+                    ));
                 }
+            }
+            Self::Lenient {
+                offset,
+                mask,
+                value,
+            } => {
+                let previous = config.read8(offset)?;
+                config.write8(offset, previous & !mask | value)?;
             }
         }
         Ok(())
@@ -164,6 +203,11 @@ impl Setup {
                 PCH_SNOOP,
             ],
             Self::AtiAzalia => &[Control::Byte {
+                offset: ATI_SNOOP_CONTROL,
+                mask: ATI_SNOOP_MASK,
+                value: ATI_SNOOP_ENABLE,
+            }],
+            Self::AmdZen => &[Control::Lenient {
                 offset: ATI_SNOOP_CONTROL,
                 mask: ATI_SNOOP_MASK,
                 value: ATI_SNOOP_ENABLE,
@@ -230,11 +274,63 @@ pub enum AttachError {
     InvalidCapabilities(CapabilityRefusal),
     MappedPreflightRequired,
     PowerNotReady,
-    ActiveDma { offset: usize },
+    ActiveDma {
+        offset: usize,
+    },
     MmioPreflight(crate::Error),
     UnsupportedPowerManagement,
     PowerTransition,
-    ConfigurationRejected,
+    /// A configuration register read as all ones or did not hold what was
+    /// just written, so preparation stopped; the log names which.
+    ConfigurationRejected(Rejection),
+}
+
+/// Which configuration register stopped preparation, and how, so a log
+/// names the step instead of a bare refusal.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct Rejection {
+    /// What preparation was doing.
+    pub step: &'static str,
+    /// The register's offset in configuration space.
+    pub offset: u16,
+    /// What was written there, or the bits it had to have; `None` when the
+    /// register only read as all ones.
+    pub wanted: Option<u32>,
+    /// What the register read back.
+    pub read: u32,
+}
+
+impl core::fmt::Debug for Rejection {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "{} at {:#04x}: ", self.step, self.offset)?;
+        if let Some(wanted) = self.wanted {
+            write!(f, "wanted {wanted:#x}, ")?;
+        }
+        write!(f, "read {:#x}", self.read)
+    }
+}
+
+impl AttachError {
+    fn rejected(step: &'static str, offset: u16, wanted: Option<u32>, read: u32) -> Self {
+        Self::ConfigurationRejected(Rejection {
+            step,
+            offset,
+            wanted,
+            read,
+        })
+    }
+}
+
+/// A vendor byte Linux writes without reading back that did not hold the
+/// bits written. Preparation goes on, as Linux does; the log reports it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Unheld {
+    /// The byte's offset in configuration space.
+    pub offset: u16,
+    /// The bits written under the control's mask.
+    pub wanted: u8,
+    /// The byte read back.
+    pub read: u8,
 }
 
 /// Which capability check refused the function, with the offsets and IDs
@@ -303,7 +399,10 @@ fn identity(vendor: u16, device: u16, class: [u8; 3]) -> Result<Identity, Attach
         (ATI, 0x437b | 0x4383) => (Setup::AtiAzalia, 32),
         // Exact AMD hosts use ATI snoop and 40-bit DMA. The later family
         // selects FIFO correction and mandatory bounded discovery below.
-        (AMD, 0x780d | 0x157a | 0x1457 | 0x1487 | 0x15e3) => (Setup::AtiAzalia, 40),
+        (AMD, 0x780d | 0x157a) => (Setup::AtiAzalia, 40),
+        // That later (Zen) family: Linux AZX_DCAPS_PRESET_AMD_SB writes the
+        // same snoop byte through update_pci_byte and never reads it back.
+        (AMD, 0x1457 | 0x1487 | 0x15e3) => (Setup::AmdZen, 40),
         // Linux binds every NVIDIA HD Audio function with
         // AZX_DCAPS_PRESET_NVIDIA and 40-bit DMA. GF108 0bea's DMI product
         // version denylist has no board field here, so it stays refused.
@@ -490,6 +589,8 @@ fn capabilities<C: ConfigSpace>(
     reset_policy: ResetPolicy,
 ) -> Result<Capabilities, AttachError> {
     let mut found = Capabilities::default();
+    // A header-only entry below the end of DEVC whose body cannot be sized.
+    let mut ambiguous_below_devc = false;
     let refuse = |refusal| Err(AttachError::InvalidCapabilities(refusal));
     let status = config.read16(regs::STATUS)?;
     if status == u16::MAX {
@@ -531,6 +632,9 @@ fn capabilities<C: ConfigSpace>(
         };
         let start = usize::from(offset16);
         let end = start + usize::from(entry.bytes);
+        if entry.layout != Layout::Sized && start < usize::from(SCH_HDA_DEVC + 2) {
+            ambiguous_below_devc = true;
+        }
         if reset_policy == ResetPolicy::IntelClockGate
             && ((start < usize::from(CGCTL + 4) && usize::from(CGCTL) < end)
                 // An unknown body's end cannot prove vendor-control ownership.
@@ -565,10 +669,21 @@ fn capabilities<C: ConfigSpace>(
             *slot = Some(offset16);
         }
     }
-    // PCH78 is Device Control, so require its known endpoint owner.
-    // Missing/unknown capabilities do not authorize writing an ambiguous body.
-    if controls.contains(&PCH_SNOOP) && found.pcie != Some(SCH_HDA_DEVC - 8) {
-        return refuse(CapabilityRefusal::PcieOwnerMissing { found: found.pcie });
+    // With a PCIe capability, PCH78 is its Device Control, so require the
+    // known endpoint owner at 0x70. Chipset-integrated PCH functions (Tiger
+    // Lake 43c8 and others) list no PCIe capability at all; there 0x78 is
+    // the vendor DEVC register that Linux azx_init_pci writes for every
+    // AZX_SNOOP_TYPE_SCH controller. That is only accepted when no
+    // header-only capability could hide a body reaching 0x78; sized bodies
+    // that alias it were already refused above.
+    if controls.contains(&PCH_SNOOP) {
+        let owned = match found.pcie {
+            Some(offset) => offset == SCH_HDA_DEVC - 8,
+            None => !ambiguous_below_devc,
+        };
+        if !owned {
+            return refuse(CapabilityRefusal::PcieOwnerMissing { found: found.pcie });
+        }
     }
     Ok(found)
 }
@@ -625,6 +740,9 @@ fn validated_bar<C: ConfigSpace>(config: &C, bar0: Bar) -> Result<(u64, u64, boo
 /// Modern Intel identities require this path: read-only PCI/MMIO ownership
 /// preflight precedes every PCI mutation. No temporary power/decode operation
 /// is used to inspect an unknown DSP owner. Legacy `prepare` refuses these IDs.
+/// For the cold entry, [`wake_cold`] may first bring such a function to D0
+/// with memory decoding on, as Linux does for the legacy class, and changes
+/// nothing else.
 /// The returned adapter keeps the exact PCI function and mandatory reset
 /// policy; use its `config()` when constructing the controller.
 ///
@@ -664,6 +782,229 @@ pub unsafe fn prepare_cold_with_registers<'a, C: ConfigSpace, R: Registers>(
 ) -> Result<PciRegisters<R, &'a mut Function<C>>, AttachError> {
     // SAFETY: forwarded original-owner cold containment prerequisites.
     unsafe { prepare_mapped(function, bar0, timer, ownership, registers, false) }
+}
+
+/// What [`wake_cold`] changed, for the boot log.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Wake {
+    /// The PCI power state the function was found in (1, 2 or 3 for D1, D2
+    /// or D3hot) when it had to enter D0; `None` when it was already in D0.
+    pub from_state: Option<u8>,
+    /// Memory decoding was off and has been turned on.
+    pub decode_enabled: bool,
+}
+
+/// What the wake did, in words, for a log line about a later failure.
+impl core::fmt::Display for Wake {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        if let Some(state) = self.from_state {
+            let state = match state {
+                3 => "D3hot",
+                2 => "D2",
+                _ => "D1",
+            };
+            write!(f, "woke it from {state} to D0")?;
+            if self.decode_enabled {
+                f.write_str(" and turned on its memory decoding")?;
+            }
+            Ok(())
+        } else if self.decode_enabled {
+            f.write_str("turned on its memory decoding")
+        } else {
+            f.write_str("changed nothing")
+        }
+    }
+}
+
+/// Bring a conventional function that firmware left in D1, D2 or D3hot, or
+/// with memory decoding off, to D0 with memory decoding on, so that
+/// `prepare_cold_with_registers` can inspect BAR0. Firmware that never used
+/// the controller may leave it either way. Linux `pci_enable_device` does the
+/// same before `azx_probe` reads the controller: `pci_set_power_state` enters
+/// D0, then `pci_enable_resources` turns memory decoding on.
+///
+/// The sequence is legacy `prepare`'s: identity, subsystem, BAR and
+/// capability checks before any write; decoding and mastering off; the BARs
+/// saved; PMCSR D0 with PME disabled and pending PME kept; the PCI PM settle
+/// time (10 ms from D3hot, 200 us from D2); a D0 readback; the saved BARs
+/// written back when a D3hot exit without No_Soft_Reset cleared them; then
+/// memory decoding on, with bus mastering left off and INTx disabled for the
+/// cold entry.
+///
+/// Identities that require mapped preflight (modern Intel) get a gentler
+/// form: bus mastering and INTx are left as found, and a function found with
+/// bus mastering on gets no write, so the cold entry still refuses it when it
+/// is not ready. Stela admits these only with the legacy class 0x040300,
+/// which Linux `snd_intel_dsp_driver_probe` sends to the legacy HDA driver
+/// (0x040100 and 0x040380 mean a DSP, for SOF or SST), and `azx_create` then
+/// calls `pcim_enable_device` before it maps BAR0 or reads GCAP. The
+/// read-only mapped preflight that follows still refuses a controller that a
+/// processing owner holds. A function already in D0 with memory decoding on
+/// gets no write either.
+///
+/// # Safety
+/// The platform ownership prerequisites of `prepare_cold_with_registers`
+/// apply, except D0 and memory decoding, which this establishes. Nothing may
+/// access the function's BAR0 mapping before this returns `Ok`.
+pub unsafe fn wake_cold<C: ConfigSpace>(
+    function: &mut Function<C>,
+    bar0: Bar,
+    timer: &impl Timer,
+) -> Result<Wake, AttachError> {
+    timer.check().map_err(AttachError::MinimumDelay)?;
+    let selected = identify(function)?;
+    // Modern Intel: no bus mastering or INTx change (see above).
+    let gentle = selected.requires_mapped_preflight();
+    let config = function.config();
+    let id = config.read32(regs::VENDOR_ID)?;
+    let class = config.read32(regs::CLASS_REVISION)?;
+    let actual = identity(
+        id as u16,
+        (id >> 16) as u16,
+        [(class >> 24) as u8, (class >> 16) as u8, (class >> 8) as u8],
+    )?;
+    if actual != selected || config.read8(regs::HEADER_TYPE)? & 0x7f != 0 {
+        return Err(AttachError::IdentityChanged);
+    }
+    check_subsystem(config, selected, BoardIdentity::Unknown)?;
+    let (base, _, wide) = validated_bar(config, bar0)?;
+    let (_, caps) = controls_and_capabilities(config, selected)?;
+    // All ones: the function does not answer (D3cold), as the cold entry says.
+    let command = config.read16(regs::COMMAND)?;
+    if command == u16::MAX {
+        return Err(AttachError::PowerNotReady);
+    }
+    let mut sleeping = None;
+    if let Some(pm) = caps.pm {
+        let version = config.read16(pm + 2)? & 7;
+        let value = config.read16(pm + 4)?;
+        if value == u16::MAX {
+            return Err(AttachError::PowerNotReady);
+        }
+        if !(1..=3).contains(&version) {
+            return Err(AttachError::UnsupportedPowerManagement);
+        }
+        if value & PM_STATE != 0 {
+            sleeping = Some((pm + 4, value));
+        }
+    }
+    let decode_off = command & regs::COMMAND_MEMORY == 0;
+    if sleeping.is_none() && !decode_off {
+        return Ok(Wake::default());
+    }
+    // Something may own a modern Intel function that is bus mastering, so
+    // it is left to the cold entry's refusal rather than turned off.
+    if gentle && command & regs::COMMAND_MASTER != 0 {
+        return Ok(Wake::default());
+    }
+    // Save the BARs before a D3hot exit can reset them. No BAR or PMCSR
+    // write happens with a live decoder or bus master.
+    let mut bars = [0; 6];
+    for (index, bar) in bars.iter_mut().enumerate() {
+        *bar = config.read32(regs::BASE_ADDRESS_0 + index as u16 * 4)?;
+    }
+    all_ones_bar("wake: BAR save", &bars)?;
+    let quiet = if gentle {
+        command & !regs::COMMAND_MEMORY
+    } else {
+        command & !(regs::COMMAND_MEMORY | regs::COMMAND_MASTER) | regs::COMMAND_INTX_DISABLE
+    };
+    if quiet != command {
+        config.write16(regs::COMMAND, quiet)?;
+    }
+    let observed = config.read16(regs::COMMAND)?;
+    if observed == u16::MAX || observed & (regs::COMMAND_MEMORY | regs::COMMAND_MASTER) != 0 {
+        return Err(AttachError::rejected(
+            "wake: decoding and bus mastering off",
+            regs::COMMAND,
+            Some(quiet.into()),
+            observed.into(),
+        ));
+    }
+    let mut wake = Wake::default();
+    if let Some((offset, value)) = sleeping {
+        let state = value & PM_STATE;
+        // PME_Status is W1C: write zero to preserve pending wake evidence.
+        config.write16(offset, value & !(PM_STATE | PM_PME_ENABLE | PM_PME_STATUS))?;
+        delay(
+            timer,
+            match state {
+                3 => 10_000,
+                2 => 200,
+                _ => 0,
+            },
+        )?;
+        let observed = config.read16(offset)?;
+        if observed == u16::MAX || observed & PM_STATE != 0 {
+            return Err(AttachError::PowerTransition);
+        }
+        if state == 3 && value & PM_NO_SOFT_RESET == 0 {
+            for (index, value) in bars.iter().enumerate() {
+                config.write32(regs::BASE_ADDRESS_0 + index as u16 * 4, *value)?;
+            }
+        }
+        wake.from_state = Some(state as u8);
+    }
+    if !bar_matches(config, base, wide)? {
+        return Err(AttachError::InvalidBar);
+    }
+    let enabled = quiet | regs::COMMAND_MEMORY;
+    config.write16(regs::COMMAND, enabled)?;
+    let observed = config.read16(regs::COMMAND)?;
+    if observed == u16::MAX
+        || observed & (regs::COMMAND_MEMORY | regs::COMMAND_MASTER) != regs::COMMAND_MEMORY
+    {
+        return Err(AttachError::rejected(
+            "wake: decoding on",
+            regs::COMMAND,
+            Some(enabled.into()),
+            observed.into(),
+        ));
+    }
+    wake.decode_enabled = decode_off;
+    Ok(wake)
+}
+
+/// The first saved BAR that reads all ones stops preparation: the function
+/// may not answer, and restoring that value after a D3hot exit would be wrong.
+fn all_ones_bar(step: &'static str, bars: &[u32; 6]) -> Result<(), AttachError> {
+    match bars.iter().position(|bar| *bar == u32::MAX) {
+        Some(index) => Err(AttachError::rejected(
+            step,
+            regs::BASE_ADDRESS_0 + index as u16 * 4,
+            None,
+            u32::MAX,
+        )),
+        None => Ok(()),
+    }
+}
+
+/// For an identity whose vendor bytes Linux writes without reading them back
+/// (Zen-family AMD), the first such byte that does not hold the bits
+/// preparation wrote. Read-only, for the boot log once preparation succeeded.
+pub fn unheld_control<C: ConfigSpace>(
+    function: &mut Function<C>,
+) -> Result<Option<Unheld>, AttachError> {
+    let selected = identify(function)?;
+    let config = function.config();
+    for control in selected.setup.controls() {
+        if let Control::Lenient {
+            offset,
+            mask,
+            value,
+        } = *control
+        {
+            let read = config.read8(offset)?;
+            if read & mask != value {
+                return Ok(Some(Unheld {
+                    offset,
+                    wanted: value,
+                    read,
+                }));
+            }
+        }
+    }
+    Ok(None)
 }
 
 unsafe fn prepare_mapped<'a, C: ConfigSpace, R: Registers>(
@@ -712,7 +1053,12 @@ unsafe fn prepare_mapped<'a, C: ConfigSpace, R: Registers>(
         }
     }
     if selected.reset_policy == ResetPolicy::IntelClockGate && config.read32(CGCTL)? == u32::MAX {
-        return Err(AttachError::ConfigurationRejected);
+        return Err(AttachError::rejected(
+            "clock gate read",
+            CGCTL,
+            None,
+            u32::MAX,
+        ));
     }
     let (major, minor) = (registers.read8(VMAJ), registers.read8(VMIN));
     if major != 1 || minor != 0 {
@@ -889,18 +1235,27 @@ unsafe fn prepare_inner<C: ConfigSpace>(
     for (index, bar) in bars.iter_mut().enumerate() {
         *bar = config.read32(regs::BASE_ADDRESS_0 + index as u16 * 4)?;
     }
-    if bars.contains(&u32::MAX) {
-        return Err(AttachError::ConfigurationRejected);
-    }
+    all_ones_bar("BAR save", &bars)?;
     let command = config.read16(regs::COMMAND)?;
     if command == u16::MAX {
-        return Err(AttachError::ConfigurationRejected);
+        return Err(AttachError::rejected(
+            "command read",
+            regs::COMMAND,
+            None,
+            0xffff,
+        ));
     }
     let command = command & !(regs::COMMAND_MEMORY | regs::COMMAND_MASTER);
     config.write16(regs::COMMAND, command | regs::COMMAND_INTX_DISABLE)?;
     let result = (|| {
-        if config.read16(regs::COMMAND)? & (regs::COMMAND_MEMORY | regs::COMMAND_MASTER) != 0 {
-            return Err(AttachError::ConfigurationRejected);
+        let observed = config.read16(regs::COMMAND)?;
+        if observed & (regs::COMMAND_MEMORY | regs::COMMAND_MASTER) != 0 {
+            return Err(AttachError::rejected(
+                "decoding and bus mastering off",
+                regs::COMMAND,
+                Some((command | regs::COMMAND_INTX_DISABLE).into()),
+                observed.into(),
+            ));
         }
         if let Some((offset, _, value)) = pmcsr {
             let state = value & PM_STATE;
@@ -936,11 +1291,17 @@ unsafe fn prepare_inner<C: ConfigSpace>(
             if let Some(offset) = offset {
                 let previous = config.read16(offset + 2)?;
                 if previous == u16::MAX {
-                    return Err(AttachError::ConfigurationRejected);
+                    return Err(AttachError::rejected("MSI off", offset + 2, None, 0xffff));
                 }
                 config.write16(offset + 2, previous & !enable)?;
-                if config.read16(offset + 2)? & enable != 0 {
-                    return Err(AttachError::ConfigurationRejected);
+                let observed = config.read16(offset + 2)?;
+                if observed & enable != 0 {
+                    return Err(AttachError::rejected(
+                        "MSI off",
+                        offset + 2,
+                        Some((previous & !enable).into()),
+                        observed.into(),
+                    ));
                 }
             }
         }
@@ -959,7 +1320,12 @@ unsafe fn prepare_inner<C: ConfigSpace>(
                 != enabled
                     & (regs::COMMAND_MEMORY | regs::COMMAND_MASTER | regs::COMMAND_INTX_DISABLE)
         {
-            return Err(AttachError::ConfigurationRejected);
+            return Err(AttachError::rejected(
+                "decoding on",
+                regs::COMMAND,
+                Some(enabled.into()),
+                readback.into(),
+            ));
         }
         Ok(Prepared {
             identity: selected,

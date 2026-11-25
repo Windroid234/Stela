@@ -132,7 +132,13 @@ impl<
         config.write16(regs::COMMAND, disabled)?;
         let observed = config.read16(regs::COMMAND)?;
         if observed == u16::MAX || observed != disabled {
-            return Err(AttachError::ConfigurationRejected.into());
+            return Err(AttachError::rejected(
+                "suspend: decoding off",
+                regs::COMMAND,
+                Some(disabled.into()),
+                observed.into(),
+            )
+            .into());
         }
         let value = config.read16(pm + 4)?;
         if value == u16::MAX || value & PM_STATE != 0 {
@@ -194,7 +200,13 @@ impl<
         config.write16(regs::COMMAND, disabled)?;
         let observed = config.read16(regs::COMMAND)?;
         if observed == u16::MAX || observed != disabled {
-            return Err(AttachError::ConfigurationRejected.into());
+            return Err(AttachError::rejected(
+                "resume: decoding off",
+                regs::COMMAND,
+                Some(disabled.into()),
+                observed.into(),
+            )
+            .into());
         }
         config.write16(
             snapshot.pm + 4,
@@ -227,12 +239,20 @@ impl<
             if let Some(offset) = offset {
                 let previous = config.read16(offset + 2)?;
                 if previous == u16::MAX {
-                    return Err(AttachError::ConfigurationRejected.into());
+                    return Err(
+                        AttachError::rejected("resume: MSI off", offset + 2, None, 0xffff).into(),
+                    );
                 }
                 config.write16(offset + 2, previous & !enable)?;
                 let observed = config.read16(offset + 2)?;
                 if observed == u16::MAX || observed & enable != 0 {
-                    return Err(AttachError::ConfigurationRejected.into());
+                    return Err(AttachError::rejected(
+                        "resume: MSI off",
+                        offset + 2,
+                        Some((previous & !enable).into()),
+                        observed.into(),
+                    )
+                    .into());
                 }
             }
         }
@@ -241,7 +261,13 @@ impl<
         let observed = config.read16(regs::COMMAND)?;
         if observed == u16::MAX || observed != enabled {
             config.write16(regs::COMMAND, disabled)?;
-            return Err(AttachError::ConfigurationRejected.into());
+            return Err(AttachError::rejected(
+                "resume: decoding on",
+                regs::COMMAND,
+                Some(enabled.into()),
+                observed.into(),
+            )
+            .into());
         }
         r.suspended = None;
         // `reinitialize` performs fresh RUN-off acknowledgements and reset

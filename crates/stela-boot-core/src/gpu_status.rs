@@ -336,9 +336,88 @@ pub fn none(adapters: &[Adapter]) -> String {
     }
 }
 
+/// The screen line that stops Install macOS before it erases anything, when
+/// no display adapter among `adapters` is an NVIDIA GPU that Stela's GPU
+/// driver runs; `None` when one is. An erase install restores recoveryOS and
+/// installs macOS from it, and both run without a GPU (recoveryOS composites
+/// in software), so without this check the whole install finishes and only
+/// the installed macOS's first start stops: "macOS cannot run without a GPU".
+/// A supported chip can still fail to start; that start names why.
+pub fn install_stop(adapters: &[Adapter]) -> Option<String> {
+    let nvidia: Vec<&Adapter> = adapters
+        .iter()
+        .filter(|found| found.vendor == Vendor::Nvidia)
+        .collect();
+    if nvidia
+        .iter()
+        .any(|found| nvidia_chip(found.device).is_some())
+    {
+        return None;
+    }
+    let why = match nvidia.first() {
+        Some(first) => refused(
+            Vendor::Nvidia,
+            &format!("{}", first.address),
+            first.device,
+            Reason::Other,
+            "",
+        ),
+        None => none(adapters),
+    };
+    Some(format!(
+        "Install macOS stopped before erasing anything, because macOS could not start on this \
+         PC: {why}"
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn install_stops_only_without_a_supported_nvidia_gpu() {
+        use stela_drivers::bus::pci::Address;
+        let at = |bus, vendor, device| Adapter {
+            address: Address {
+                segment: 0,
+                bus,
+                device: 0,
+                function: 0,
+            },
+            vendor,
+            device,
+            class: [3, 0, 0],
+        };
+        let start = "Install macOS stopped before erasing anything, because macOS could not \
+                     start on this PC: ";
+        // A GeForce GTX 1060 (Pascal) alone.
+        let pascal = at(1, Vendor::Nvidia, 0x1c03);
+        assert_eq!(
+            install_stop(&[pascal]).unwrap(),
+            format!(
+                "{start}the NVIDIA GPU at 0000:01:00.0 (device 1c03) is not supported: Stela \
+                 needs {SUPPORTED}"
+            )
+        );
+        // A laptop with only its Intel graphics (Haswell HD Graphics 4400).
+        let intel = at(0, Vendor::Intel, 0x0a16);
+        assert_eq!(
+            install_stop(&[intel]).unwrap(),
+            format!("{start}{}", none(&[intel]))
+        );
+        assert!(
+            install_stop(&[])
+                .unwrap()
+                .contains("this PC has no NVIDIA GPU: Stela needs")
+        );
+        // A Turing, Ampere, Ada or Blackwell chip, alone or beside others,
+        // lets the install run.
+        for device in [0x1f08, 0x2503, 0x2782, 0x2d05] {
+            let supported = at(2, Vendor::Nvidia, device);
+            assert_eq!(install_stop(&[supported]), None, "device {device:04x}");
+            assert_eq!(install_stop(&[intel, pascal, supported]), None);
+        }
+    }
 
     #[test]
     fn a_gpu_of_another_maker_is_named_by_its_maker() {

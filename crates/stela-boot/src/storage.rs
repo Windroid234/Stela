@@ -270,6 +270,21 @@ fn report_census(functions: &[crate::pci_io::FunctionObservation]) {
             ": {}\n",
             stela_drivers::probe::plan(&identity, &displays)
         ));
+        // An HD Audio function's whole configuration space as firmware left
+        // it, before any driver writes, in `lspci -xxx` rows of 64 bytes.
+        if let Some(tail) = &function.audio_tail {
+            for (row, bytes) in header.chunks(64).chain(tail.chunks(64)).enumerate() {
+                let mut line = alloc::string::String::with_capacity(bytes.len() * 3);
+                for byte in bytes {
+                    let _ = core::fmt::Write::write_fmt(&mut line, format_args!(" {byte:02x}"));
+                }
+                output::arguments(format_args!(
+                    "HOST PCI {} config {:02x}:{line}\n",
+                    identity.address,
+                    row * 64
+                ));
+            }
+        }
     }
     if functions.len() > CENSUS_LINES {
         output::arguments(format_args!(

@@ -81,6 +81,9 @@ pub enum Error {
     HdaPci(crate::audio::hda::pci::AttachError),
     Hda(crate::audio::Error),
     HdaNative(native::hda::RetirementError),
+    /// A native HD Audio failure after the wake changed the controller's
+    /// power or decoding, with what the wake changed.
+    HdaNativeAfterWake(native::hda::RetirementError, crate::audio::hda::pci::Wake),
     Usb4(native::usb4::Refusal),
     /// A driver here claimed the function and its start recorded no
     /// device, no failure and no reason: the probe names it, so no claimed
@@ -114,6 +117,9 @@ impl fmt::Display for Error {
             Self::HdaPci(error) => write!(f, "HD Audio PCI: {error:?}"),
             Self::Hda(error) => write!(f, "HD Audio: {error:?}"),
             Self::HdaNative(error) => write!(f, "HD Audio native: {error:?}"),
+            Self::HdaNativeAfterWake(error, wake) => {
+                write!(f, "HD Audio native: {error:?} (Stela first {wake})")
+            }
             Self::Usb4(refusal) => write!(f, "USB4 host: {refusal}"),
             Self::Unrecorded => {
                 f.write_str("its driver started and recorded no device and no failure")
@@ -1067,7 +1073,10 @@ impl Devices {
             Error::IntelBluetooth(_) | Error::Bcm4377(_) => "Bluetooth",
             Error::Sfh(_) | Error::SfhCold(_) | Error::Ish(_) | Error::IshCold(_) => "sensors",
             Error::Ehci(_) => "USB",
-            Error::HdaPci(_) | Error::Hda(_) | Error::HdaNative(_) => "audio",
+            Error::HdaPci(_)
+            | Error::Hda(_)
+            | Error::HdaNative(_)
+            | Error::HdaNativeAfterWake(..) => "audio",
             Error::Usb4(_) => "USB4",
             _ => by_class,
         }
