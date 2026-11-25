@@ -174,7 +174,14 @@ fn rejected_snoop_keeps_mastering_disabled() {
             );
             assert!(function.config().writes.is_empty());
         } else {
-            assert_eq!(result, AttachError::ConfigurationRejected);
+            assert_eq!(
+                result,
+                if variant == 1 {
+                    AttachError::rejected("vendor control", 0x42, Some(2), 0)
+                } else {
+                    AttachError::rejected("vendor control", 0x42, None, 0xff)
+                }
+            );
             assert_eq!(
                 function.config().get16(regs::COMMAND)
                     & (regs::COMMAND_MEMORY | regs::COMMAND_MASTER),
@@ -202,7 +209,11 @@ fn failed_controls_rejected_before_updates() {
         }
         assert_eq!(
             prepare_model(&mut function, &timer, bar).unwrap_err(),
-            AttachError::ConfigurationRejected
+            if vendor_fault {
+                AttachError::rejected("vendor control", TCSEL, None, 0xff)
+            } else {
+                AttachError::rejected("command read", regs::COMMAND, None, 0xffff)
+            }
         );
         if vendor_fault {
             assert!(
@@ -215,5 +226,58 @@ fn failed_controls_rejected_before_updates() {
         } else {
             assert!(function.config().writes.is_empty());
         }
+    }
+}
+
+#[test]
+fn zen_snoop_is_written_like_linux_and_reported_when_it_does_not_hold() {
+    for device in [0x1457, 0x1487, 0x15e3] {
+        // Holds: the neighbor bits are kept and there is nothing to report.
+        let (mut function, timer, bar) = fixture(0);
+        set_identity(&mut function, AMD, device);
+        function.config().words[16] = 0x00f5_0000;
+        prepare_model(&mut function, &timer, bar).unwrap();
+        assert_eq!(function.config().read8(ATI_SNOOP_CONTROL).unwrap(), 0xf2);
+        assert_eq!(unheld_control(&mut function), Ok(None));
+
+        // Ignored, even from all ones: written as Linux update_pci_byte
+        // writes it, then reported instead of refused.
+        for (before, written) in [(0xf5u8, 0xf2u8), (0xff, 0xfa)] {
+            let (mut function, timer, bar) = fixture(0);
+            set_identity(&mut function, AMD, device);
+            function.config().words[16] = u32::from(before) << 16;
+            function.config().reject_vendor_control = true;
+            prepare_model(&mut function, &timer, bar).unwrap();
+            assert!(
+                function
+                    .config()
+                    .writes
+                    .iter()
+                    .any(|(offset, width, value, _)| (*offset, *width, *value)
+                        == (ATI_SNOOP_CONTROL, 1, u32::from(written)))
+            );
+            assert_eq!(
+                unheld_control(&mut function),
+                Ok(Some(Unheld {
+                    offset: ATI_SNOOP_CONTROL,
+                    wanted: ATI_SNOOP_ENABLE,
+                    read: before,
+                }))
+            );
+        }
+    }
+}
+
+#[test]
+fn older_ati_and_amd_snoop_is_still_refused() {
+    for (vendor, device) in [(ATI, 0x437b), (ATI, 0x4383), (AMD, 0x780d), (AMD, 0x157a)] {
+        let (mut function, timer, bar) = fixture(0);
+        set_identity(&mut function, vendor, device);
+        function.config().reject_vendor_control = true;
+        assert_eq!(
+            prepare_model(&mut function, &timer, bar).unwrap_err(),
+            AttachError::rejected("vendor control", ATI_SNOOP_CONTROL, Some(2), 0)
+        );
+        assert_eq!(unheld_control(&mut function), Ok(None));
     }
 }

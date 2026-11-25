@@ -244,7 +244,12 @@ fn failed_modern_intel_wake_leaves_decoding_off() {
     function.config().reject_command = true;
     assert_eq!(
         wake_model(&mut function, &timer, bar).unwrap_err(),
-        AttachError::ConfigurationRejected
+        AttachError::rejected(
+            "wake: decoding and bus mastering off",
+            regs::COMMAND,
+            Some(0),
+            DECODE.into()
+        )
     );
     assert!(
         !function
@@ -285,7 +290,12 @@ fn failed_wake_leaves_decoding_off() {
     function.config().reject_command = true;
     assert_eq!(
         wake_model(&mut function, &timer, bar).unwrap_err(),
-        AttachError::ConfigurationRejected
+        AttachError::rejected(
+            "wake: decoding and bus mastering off",
+            regs::COMMAND,
+            Some(0x400),
+            0x406
+        )
     );
     assert!(
         !function
@@ -293,5 +303,41 @@ fn failed_wake_leaves_decoding_off() {
             .writes
             .iter()
             .any(|(offset, _, _, _)| *offset == 0x54)
+    );
+}
+
+#[test]
+fn wake_says_what_it_did() {
+    for (from_state, decode_enabled, text) in [
+        (
+            Some(3),
+            true,
+            "woke it from D3hot to D0 and turned on its memory decoding",
+        ),
+        (Some(2), false, "woke it from D2 to D0"),
+        (Some(1), false, "woke it from D1 to D0"),
+        (None, true, "turned on its memory decoding"),
+        (None, false, "changed nothing"),
+    ] {
+        let wake = Wake {
+            from_state,
+            decode_enabled,
+        };
+        assert_eq!(alloc::format!("{wake}"), text);
+    }
+}
+
+#[test]
+fn a_rejection_names_its_step_register_and_values() {
+    assert_eq!(
+        alloc::format!(
+            "{:?}",
+            AttachError::rejected("wake: decoding on", regs::COMMAND, Some(0x406), 0x404)
+        ),
+        "ConfigurationRejected(wake: decoding on at 0x04: wanted 0x406, read 0x404)"
+    );
+    assert_eq!(
+        alloc::format!("{:?}", AttachError::rejected("MSI off", 0x62, None, 0xffff)),
+        "ConfigurationRejected(MSI off at 0x62: read 0xffff)"
     );
 }

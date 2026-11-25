@@ -1901,6 +1901,13 @@ pub unsafe fn open(
                 "HOST HD AUDIO {location}: turned on the memory decoding firmware left off\n"
             ));
         }
+        if let Some(unheld) = host.unheld {
+            output::arguments(format_args!(
+                "HOST HD AUDIO {location}: config byte {:#04x} did not take the snoop bits \
+                 {:#04x} (reads {:#04x}); Linux never checks it, so Stela went on\n",
+                unheld.offset, unheld.wanted, unheld.read
+            ));
+        }
         for codec in &host.codecs {
             let graph = &codec.graph;
             match &codec.setup {

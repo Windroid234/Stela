@@ -173,6 +173,8 @@ struct Resources<R, T> {
     _pin_failure: Option<preparation::PinReleaseFailure>,
     /// What preparation changed to wake the controller.
     wake: hda::pci::Wake,
+    /// A vendor byte written as Linux writes it that did not hold.
+    unheld: Option<hda::pci::Unheld>,
 }
 struct Owner<R, T>(Option<Box<Resources<R, T>>>);
 impl<R, T> Drop for Owner<R, T> {
@@ -190,6 +192,13 @@ pub(super) struct Failure<R, T> {
     _owner: Owner<R, T>,
 }
 impl<R, T> Failure<R, T> {
+    /// What preparation changed to wake the controller before it failed.
+    pub(super) fn wake(&self) -> hda::pci::Wake {
+        self._owner
+            .0
+            .as_ref()
+            .map_or_else(hda::pci::Wake::default, |r| r.wake)
+    }
     pub(super) fn construction_error(&self) -> Option<&crate::block::BlockError> {
         self._owner
             .0
@@ -249,6 +258,7 @@ impl<R: NativeRegisters, T: audio::Timer + Clone> Native<R, T> {
             retiring_function: None,
             _pin_failure: None,
             wake: hda::pci::Wake::default(),
+            unheld: None,
         })));
         let result = Self::prepare(owner.resources());
         match result {
@@ -270,6 +280,10 @@ impl<R: NativeRegisters, T: audio::Timer + Clone> Native<R, T> {
             .0
             .as_ref()
             .map_or_else(hda::pci::Wake::default, |r| r.wake)
+    }
+    /// A vendor byte preparation wrote as Linux does that did not hold.
+    pub fn unheld(&self) -> Option<hda::pci::Unheld> {
+        self.owner.0.as_ref().and_then(|r| r.unheld)
     }
     fn prepare(r: &mut Resources<R, T>) -> Result<(), Error> {
         crate::bus::pci::power::Timer::check(&r.clock)
@@ -307,6 +321,11 @@ impl<R: NativeRegisters, T: audio::Timer + Clone> Native<R, T> {
         let config = registers.config();
         let stopped = hda::cold::stop_inherited(&mut registers, &r.clock, &config)?;
         let (prepared, _, _) = registers.into_parts();
+        // Zen AMD's snoop byte is written the way Linux writes it, without
+        // a refusal; note one that did not hold for the boot log. A read
+        // failure here only loses the note.
+        r.unheld = hda::pci::unheld_control(r.requester.as_mut().unwrap().function_mut())
+            .unwrap_or_default();
         // Source stop/masks above do not establish original IRQ ingress, EOI,
         // firmware or deferred-service completion. Native has no producer;
         // retain the complete original graph and refuse instead of binding.

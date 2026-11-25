@@ -214,7 +214,13 @@ fn snoop_failure_stops_at_the_failed_control() {
         }
         assert_eq!(
             prepare_model(&mut function, &timer, bar).unwrap_err(),
-            AttachError::ConfigurationRejected
+            match variant {
+                0 => AttachError::rejected("vendor control", SCH_HDA_DEVC, None, 0xffff),
+                // DEVC 0x7a55 with No Snoop cleared did not stick, or read
+                // all ones once written.
+                1 => AttachError::rejected("vendor control", SCH_HDA_DEVC, Some(0x7255), 0x7a55),
+                _ => AttachError::rejected("vendor control", SCH_HDA_DEVC, Some(0x7255), 0xffff),
+            }
         );
         let config = function.config();
         assert_eq!(
