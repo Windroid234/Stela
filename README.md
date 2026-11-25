@@ -8,22 +8,25 @@ program with an arm64-to-x86-64 translator, a Metal driver for NVIDIA GPUs and
 a model of Apple silicon hardware. Stela currently presents itself as an M2 Mac mini.
 
 > [!NOTE]
-> **About this fork.** This is a fork of [tylertms/Stela](https://github.com/tylertms/Stela) that keeps up with it and adds mods and fixes on top. Tyler's [official releases](https://github.com/tylertms/Stela/releases) don't include them.
+> **About this fork.** This is a fork of Stela by Tyler ([tylertms/Stela](https://github.com/tylertms/Stela), now archived) with mods and fixes on top. On 22 November 2026 Tyler removed the original repository, whose README now says Tyler does not endorse, and is not affiliated with, any forks or continuations. That includes this one, so please don't contact Tyler about it: report problems here instead.
 >
 > | Mod | What it does | Status |
 > |---|---|---|
 > | 🔊 **Audio bridge** | Plays macOS's sound through the PC's own HD Audio: line-out, speakers or headphones | 🧪 In [test build 3](https://github.com/reece-builds/Stela-Mods/releases/tag/v0.5.102). Nobody has heard sound from it yet |
 > | ⏰ **Sound chip wake-up** | Starts an onboard sound chip that the PC's firmware left asleep, the way Linux does. It fixes `HD Audio native: Pci(PowerNotReady)` | 🧪 In [test build 3](https://github.com/reece-builds/Stela-Mods/releases/tag/v0.5.102) |
-> | 🔵 **Raptor Lake sound fix** | Lets Intel 600 and 700-series sound chips start. Made by [justpainful](https://github.com/tylertms/Stela/pull/244) | ✅ In `main`, coming in the next test build |
+> | 🔵 **Raptor Lake sound fix** | Lets Intel 600 and 700-series sound chips start. Made by [justpainful](https://github.com/justpainful) | ✅ In `main`, coming in the next test build |
 > | 🌙 **Newer Intel wake-up** | The same wake-up for newer Intel sound chips (6th-gen Core and up), done gently: it only powers the chip on and turns on its memory access, like Linux, and leaves the chip alone if something is using it | ✅ In `main`, coming in the next test build |
 > | 🛑 **GPU check** | Install macOS stops before erasing anything if the PC's GPU can't run macOS, instead of finishing a long install that can never start | ✅ In `main`, coming in the next test build |
+> | 🧰 **AMD sound fix** | Newer AMD sound chips (Ryzen) get their memory "snoop" setting the way Linux sets it, instead of refusing to start when it doesn't stick. When a sound chip still won't start, the boot log now says which step failed and what the chip answered | ✅ In `main`, coming in the next test build |
 >
 > - 🧪 **Help test it:** if you have a PC with a GTX 16 or RTX GPU, see [Testers wanted](https://github.com/reece-builds/Stela-Mods/issues/3).
-> - ❌ **GTX 10 (Pascal) GPUs are not supported.** An earlier version of this fork said they were, which was wrong: Pascal needs NVIDIA firmware that is signature-locked, as explained in [tylertms/Stela#252](https://github.com/tylertms/Stela/issues/252). The earlier GTX 10 downloads were broken and have been removed.
+> - ❌ **GTX 10 (Pascal) GPUs are not supported.** An earlier version of this fork said they were, which was wrong: Pascal needs NVIDIA firmware that is signature-locked, as Tyler explained before the original repository was removed. The earlier GTX 10 downloads were broken and have been removed.
 
 > [!TIP]
 > **🏆 Testers hall of fame**
 > - [**FASTDROPX**](https://github.com/FASTDROPX): the first real-hardware test, on test build 1. Their boot log found the bug that stopped Stela's sound chip from starting.
+> - [**NikNikovsky**](https://github.com/NikNikovsky): tested on an RTX 3070 with an Intel 600-series board. Their test build 3 log showed the Intel sound chip check that justpainful's fix covers.
+> - [**FlookyPupper**](https://github.com/FlookyPupper): tested test build 3 on a Ryzen 5 5600GT with an RTX 3060. Their log led to the AMD sound fix and the clearer sound errors.
 >
 > Your name could be next: see [Testers wanted](https://github.com/reece-builds/Stela-Mods/issues/3) 🙌
 
@@ -61,9 +64,8 @@ and supports the Metal3 and Apple7 GPU families.
 ## Install
 
 1. Download `stela` from this fork's
-   [releases page](https://github.com/reece-builds/Stela-Mods/releases).
-   Tyler's [official releases](https://github.com/tylertms/Stela/releases)
-   don't have this fork's mods.
+   [releases page](https://github.com/reece-builds/Stela-Mods/releases):
+   take the newest test build.
 2. Run `sudo ./stela` (Linux, macOS) or double-click `stela.exe`
    (Windows).
 3. Choose the USB stick and the installer, then confirm. This erases the USB
@@ -108,8 +110,8 @@ You need [Rust](https://rustup.rs), git, Python 3.10 or newer, and LLVM 21,
 newer also works.
 
 ```sh
-git clone https://github.com/tylertms/Stela
-cd Stela
+git clone https://github.com/reece-builds/Stela-Mods
+cd Stela-Mods
 cargo xtask dist
 ```
 
@@ -125,4 +127,5 @@ Stela's code is GPL-2.0-or-later. See [LICENSE](LICENSE) and [NOTICE](NOTICE).
 
 ## Community
 
-[Discord Server](https://discord.gg/aSkwrJEMYc)
+Questions, test results and bug reports for this fork go in its
+[GitHub Issues](https://github.com/reece-builds/Stela-Mods/issues).
